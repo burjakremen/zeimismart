@@ -168,3 +168,136 @@ if __name__ == "__main__":
 
     ser.close()
 ```
+
+** C++-код для Wemos D1 (ESP8266): **
+```
+#include <Arduino.h>
+#include <TimeLib.h>  // Библиотека для работы со временем
+#include <SoftwareSerial.h>
+
+// Префиксы для каждой команды (в виде массива байтов)
+const char* prefixes_open[] = {"b352", "a243", "8061", "9170", "7f9e", "6e8f", "5dbc", "4cad", "3bda", "2acb", "19f8", "08e9", "f716", "e607", "d534", "c425"};
+const char* prefixes_close[] = {"d034", "c125", "2fcb", "3eda", "0de9", "1cf8", "6b8f", "7a9e", "49ad", "58bc", "a743", "b652", "8561", "9470", "e307", "f216"};
+const char* prefixes_stop[] = {"688f", "799e", "4aad", "5bbc", "2ccb", "3dda", "1ff8", "0ee9", "9770", "8661", "b552", "a443", "d334", "c225", "e007", "f116"};
+
+// Шаги для b3
+const uint8_t steps[] = {17, 51, 17, 119, 17, 34, 17, 51, 17, 119, 17, 51, 17, 255, 17, 51, 17, 119};
+
+// Начальные пакеты (в виде hex-строк)
+const char* initial_open = "b35220f5b745c2f4588";
+const char* initial_close = "d0344a94d123a895fe8";
+const char* initial_stop = "688ffc2c6a981e2d778";
+
+// Глобальные переменные для хранения времени (в секундах с эпохи)
+time_t prev_time_open = 0;
+time_t prev_time_close = 0;
+time_t prev_time_stop = 0;
+
+SoftwareSerial serial(13, 15);  // RX, TX для Wemos D1 (D7, D8)
+
+uint8_t hexToByte(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+}
+
+void parseHexString(const char* hex, uint8_t* bytes, int len) {
+    for (int i = 0; i < len; i += 2) {
+        bytes[i / 2] = (hexToByte(hex[i]) << 4) | hexToByte(hex[i + 1]);
+    }
+}
+
+void generatePacket(int counter, uint8_t* prev_packet, time_t prev_time, const char** command_prefixes, time_t current_time, const char** prev_command) {
+    const char* prefix = command_prefixes[counter % 16];
+    uint8_t b1, b2;
+    parseHexString(prefix, &b1, 2);  // Берем первые 2 байта префикса
+
+    if (counter == 0) {
+        parseHexString(initial_open, prev_packet, 9);  // Начальный пакет для "Открыть"
+        if (command_prefixes == prefixes_close) parseHexString(initial_close, prev_packet, 9);
+        if (command_prefixes == prefixes_stop) parseHexString(initial_stop, prev_packet, 9);
+        return;
+    }
+
+    uint8_t step = steps[(counter - 1) % 18];
+    uint8_t b3 = (prev_packet[2] - step) % 256;
+    float interval = (current_time - prev_time);
+
+    uint8_t b4 = prev_packet[3];
+    if (b3 < 30) {
+        b4 = (b4 + 17) % 256;
+        if (interval > 12) b4 = (b4 ^ 0x11) % 256;
+    } else if (interval > 30) {
+        b4 = (b4 + 34) % 256;
+    } else if (interval < 5 && prev_command && prev_command != command_prefixes) {
+        b4 = (b4 + 17) % 256;
+    } else if (interval > 10 && interval < 30 && b3 > 200) {
+        b4 = (b4 - 17) % 256;
+    } else if (interval < 2 && b3 > 200) {
+        b4 = (b4 + 1) % 256;
+    }
+
+    uint8_t b5 = b2 ^ 229;
+    uint8_t b6 = b2 ^ 23;
+    uint8_t b7 = b3 ^ 226;
+    uint8_t b8 = b4 ^ 1;
+    prev_packet[0] = b1; prev_packet[1] = b2; prev_packet[2] = b3;
+    prev_packet[3] = b4; prev_packet[4] = b5; prev_packet[5] = b6;
+    prev_packet[6] = b7; prev_packet[7] = b8; prev_packet[8] = 8;
+}
+
+void sendCommand(const char* command, int packet_count = 50, float delay_sec = 2.25) {
+    const char** command_prefixes = prefixes_open;
+    const char** prev_command = NULL;
+    if (strcmp(command, "close") == 0) command_prefixes = prefixes_close;
+    else if (strcmp(command, "stop") == 0) command_prefixes = prefixes_stop;
+
+    time_t current_time = now();  // Текущее время в секундах
+    uint8_t prev_packet[9] = {0};
+    time_t prev_time = prev_time_open;
+    if (command_prefixes == prefixes_close) prev_time = prev_time_close;
+    else if (command_prefixes == prefixes_stop) {
+        prev_time = prev_time_stop;
+        if (prev_time_close > 0) prev_command = prefixes_close;
+    }
+
+    for (int i = 0; i < packet_count; i++) {
+        generatePacket(i, prev_packet, prev_time, command_prefixes, current_time, prev_command);
+        serial.write(prev_packet, 9);  // Отправка пакета через Serial
+        delay(delay_sec * 1000);  // Задержка в миллисекундах (2.25 сек)
+
+        prev_time = current_time;
+        current_time = now();  // Обновляем время
+    }
+
+    // Сохранение времени последней команды
+    if (command_prefixes == prefixes_open) prev_time_open = current_time;
+    else if (command_prefixes == prefixes_close) prev_time_close = current_time;
+    else prev_time_stop = current_time;
+}
+
+void setup() {
+    Serial.begin(9600);  // Инициализация Serial для отладки
+    serial.begin(9600);  // Инициализация SoftwareSerial для передачи пакетов
+
+    // Настройка времени (пример, нужно синхронизировать с RTC или NTP)
+    setTime(26, 52, 12, 26, 12, 2024);  // Установить начальное время (DD, HH, MM, DD, MM, YYYY)
+}
+
+void loop() {
+    // Пример отправки команд (можно запускать по триггеру, например, по кнопке)
+    sendCommand("open");  // Открыть
+    delay(5000);  // Пауза 5 сек
+    sendCommand("close");  // Закрыть
+    delay(5000);  // Пауза 5 сек
+    sendCommand("stop");  // Стоп
+    delay(5000);  // Пауза 5 сек
+}
+```
+
+Примечания к коду:
+
+* OrangePi3 (Python): Код предполагает использование UART (/dev/ttyS1) с baud rate 9600. Можно адаптировать порт и скорость под конкретное оборудование. Для работы с реальным временем используется datetime.now().
+* Wemos D1 (C++): Код использует SoftwareSerial для отправки пакетов через UART. Для работы со временем необходима синхронизация (например, через NTP или RTC). Если требуется WiFi, можно добавить отправку через UDP/TCP, заменив serial.write на отправку через WiFi.
+* Оба кода генерируют пакеты с интервалом ~2.25 секунды (как в данных), но интервал можно настроить под нужды устройства.
